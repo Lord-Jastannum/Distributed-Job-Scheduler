@@ -6,7 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.v1 import auth, organizations, queues, jobs
+from app.api.v1 import auth, organizations, queues, jobs, workers
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scheduler")
@@ -17,6 +17,7 @@ app.include_router(auth.router)
 app.include_router(organizations.router)
 app.include_router(queues.router)
 app.include_router(jobs.router)
+app.include_router(workers.router)
 
 
 @app.exception_handler(StarletteHTTPException)
