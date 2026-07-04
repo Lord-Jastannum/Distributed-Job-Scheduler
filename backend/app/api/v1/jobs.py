@@ -11,6 +11,7 @@ from app.core.database import get_db
 from app.models.job import Job
 from app.models.scheduled_job import ScheduledJob
 from app.models.queue import Queue
+from app.models.dead_letter_queue import DeadLetterQueue
 from app.models.user import User
 from app.schemas.job import (
     JobCreate,
@@ -20,6 +21,7 @@ from app.schemas.job import (
     ScheduledJobOut,
     JobStatus,
 )
+from app.schemas.dead_letter_queue import DeadLetterQueueOut
 
 router = APIRouter(prefix="/api/v1", tags=["jobs"])
 
@@ -195,3 +197,63 @@ def deactivate_scheduled_job(
     db.commit()
     db.refresh(scheduled_job)
     return scheduled_job
+
+
+# ---- Dead Letter Queue ----
+
+
+@router.get("/queues/{queue_id}/dead-letter-queue", response_model=list[DeadLetterQueueOut])
+def list_dead_letter_entries(
+    queue_id: uuid.UUID,
+    include_resolved: bool = Query(default=False),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _get_owned_queue(db, queue_id, current_user)
+    q = db.query(DeadLetterQueue).join(Job, Job.id == DeadLetterQueue.job_id).filter(Job.queue_id == queue_id)
+    if not include_resolved:
+        q = q.filter(DeadLetterQueue.resolved.is_(False))
+    return q.order_by(DeadLetterQueue.moved_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+
+
+@router.post("/dead-letter-queue/{dlq_id}/replay", response_model=JobOut)
+def replay_dead_letter_job(
+    dlq_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    """Resets the job's attempt count and puts it back in the queue for a fresh run."""
+    dlq_entry = db.get(DeadLetterQueue, dlq_id)
+    if dlq_entry is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dead letter entry not found")
+
+    job = db.get(Job, dlq_entry.job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Underlying job not found")
+    _get_owned_queue(db, job.queue_id, current_user)
+
+    job.status = "queued"
+    job.attempt_count = 0
+    job.run_at = datetime.now(timezone.utc)
+    job.worker_id = None
+    job.claimed_at = None
+    dlq_entry.resolved = True
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+@router.post("/dead-letter-queue/{dlq_id}/dismiss", response_model=DeadLetterQueueOut)
+def dismiss_dead_letter_job(
+    dlq_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    """Marks a DLQ entry as resolved without replaying the job (e.g. it was bad data, not worth retrying)."""
+    dlq_entry = db.get(DeadLetterQueue, dlq_id)
+    if dlq_entry is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dead letter entry not found")
+    job = db.get(Job, dlq_entry.job_id)
+    _get_owned_queue(db, job.queue_id, current_user)
+    dlq_entry.resolved = True
+    db.commit()
+    db.refresh(dlq_entry)
+    return dlq_entry

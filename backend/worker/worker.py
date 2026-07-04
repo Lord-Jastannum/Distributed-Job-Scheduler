@@ -28,6 +28,14 @@ from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+sys_path_added = False
+try:
+    from app.core.retry import compute_retry_delay_seconds
+except ImportError:
+    import sys as _sys
+    _sys.path.insert(0, ".")
+    from app.core.retry import compute_retry_delay_seconds
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] worker=%(worker_short)s %(message)s",
@@ -73,7 +81,12 @@ CLAIM_SQL = text("""
         FOR UPDATE SKIP LOCKED
         LIMIT :batch_size
     )
-    RETURNING id, type, payload, attempt_count;
+    RETURNING id, type, payload, attempt_count, retry_policy_id;
+""")
+
+RETRY_POLICY_SQL = text("""
+    SELECT strategy, base_delay_seconds, max_retries, max_delay_seconds
+    FROM retry_policies WHERE id = :id
 """)
 
 
@@ -156,6 +169,24 @@ class Worker:
 
     # -- execution -------------------------------------------------------------
 
+    def _get_retry_policy(self, retry_policy_id):
+        if retry_policy_id is None:
+            return {"strategy": "fixed", "base_delay_seconds": 5, "max_retries": 3, "max_delay_seconds": 3600}
+        with self.Session() as session:
+            row = session.execute(RETRY_POLICY_SQL, {"id": retry_policy_id}).mappings().first()
+            return dict(row) if row else {
+                "strategy": "fixed", "base_delay_seconds": 5, "max_retries": 3, "max_delay_seconds": 3600
+            }
+
+    def _execute_job_safe(self, job: dict):
+        """Wrapper so unexpected exceptions in a worker thread are logged immediately
+        instead of sitting silently in the Future until something calls .result()."""
+        try:
+            self.execute_job(job)
+        except Exception:
+            self.logger.exception(f"Unhandled exception processing job {job['id']} — job left in inconsistent state")
+            self._active_jobs = max(0, self._active_jobs - 1)
+
     def execute_job(self, job: dict):
         job_id = job["id"]
         attempt_number = job["attempt_count"] + 1
@@ -166,9 +197,7 @@ class Worker:
 
         with self.Session() as session:
             session.execute(
-                text(
-                    "UPDATE jobs SET status = 'running', updated_at = now() WHERE id = :id"
-                ),
+                text("UPDATE jobs SET status = 'running', updated_at = now() WHERE id = :id"),
                 {"id": job_id},
             )
             session.execute(
@@ -189,13 +218,13 @@ class Worker:
         self.logger.info(f"Started job {job_id} (type={job['type']}, attempt={attempt_number})")
 
         error_message = None
+        succeeded = False
         try:
             run_handler(job["type"], job["payload"])
-            final_status = "completed"
-        except Exception as exc:  # noqa: BLE001 - deliberately broad, this is a generic executor
-            final_status = "failed"
+            succeeded = True
+        except Exception as exc:  # noqa: BLE001 - generic executor, any handler exception is a job failure
             error_message = str(exc)
-            self.logger.warning(f"Job {job_id} failed: {error_message}")
+            self.logger.warning(f"Job {job_id} raised: {error_message}")
 
         finished = datetime.now(timezone.utc)
         duration_ms = int((finished - started).total_seconds() * 1000)
@@ -203,18 +232,11 @@ class Worker:
         with self.Session() as session:
             session.execute(
                 text(
-                    "UPDATE jobs SET status = :status, attempt_count = :attempt_count, updated_at = now() "
-                    "WHERE id = :id"
-                ),
-                {"status": final_status, "attempt_count": attempt_number, "id": job_id},
-            )
-            session.execute(
-                text(
                     "UPDATE job_executions SET status = :status, finished_at = :finished_at, "
                     "duration_ms = :duration_ms, error_message = :error_message WHERE id = :eid"
                 ),
                 {
-                    "status": final_status,
+                    "status": "completed" if succeeded else "failed",
                     "finished_at": finished,
                     "duration_ms": duration_ms,
                     "error_message": error_message,
@@ -223,8 +245,61 @@ class Worker:
             )
             session.commit()
 
-        self.logger.info(f"Finished job {job_id} -> {final_status} ({duration_ms}ms)")
+        if succeeded:
+            with self.Session() as session:
+                session.execute(
+                    text(
+                        "UPDATE jobs SET status = 'completed', attempt_count = :n, updated_at = now() WHERE id = :id"
+                    ),
+                    {"n": attempt_number, "id": job_id},
+                )
+                session.commit()
+            self.logger.info(f"Finished job {job_id} -> completed ({duration_ms}ms)")
+        else:
+            self._handle_failure(job_id, job["retry_policy_id"], attempt_number, error_message)
+
         self._active_jobs -= 1
+
+    def _handle_failure(self, job_id, retry_policy_id, attempt_number: int, error_message: str):
+        policy = self._get_retry_policy(retry_policy_id)
+        if attempt_number < policy["max_retries"]:
+            delay = compute_retry_delay_seconds(
+                policy["strategy"], attempt_number, policy["base_delay_seconds"], policy["max_delay_seconds"]
+            )
+            with self.Session() as session:
+                session.execute(
+                    text(
+                        "UPDATE jobs SET status = 'scheduled', attempt_count = :n, "
+                        "run_at = now() + (:delay || ' seconds')::interval, "
+                        "worker_id = NULL, claimed_at = NULL, updated_at = now() WHERE id = :id"
+                    ),
+                    {"n": attempt_number, "delay": delay, "id": job_id},
+                )
+                session.commit()
+            self.logger.warning(
+                f"Job {job_id} failed (attempt {attempt_number}/{policy['max_retries']}) — "
+                f"retrying in {delay:.1f}s [{policy['strategy']}]"
+            )
+        else:
+            with self.Session() as session:
+                session.execute(
+                    text(
+                        "UPDATE jobs SET status = 'dead_letter', attempt_count = :n, updated_at = now() "
+                        "WHERE id = :id"
+                    ),
+                    {"n": attempt_number, "id": job_id},
+                )
+                session.execute(
+                    text(
+                        "INSERT INTO dead_letter_queue (id, job_id, final_error, attempt_count, moved_at, resolved) "
+                        "VALUES (:id, :job_id, :error, :n, now(), false)"
+                    ),
+                    {"id": uuid.uuid4(), "job_id": job_id, "error": error_message, "n": attempt_number},
+                )
+                session.commit()
+            self.logger.error(
+                f"Job {job_id} exhausted {policy['max_retries']} retries — moved to Dead Letter Queue"
+            )
 
     # -- main loop ---------------------------------------------------------------
 
@@ -252,7 +327,7 @@ class Worker:
                 if available_slots > 0:
                     jobs = self.claim_batch(available_slots)
                     for job in jobs:
-                        future = self._executor.submit(self.execute_job, job)
+                        future = self._executor.submit(self._execute_job_safe, job)
                         self._in_flight.append(future)
 
                 time.sleep(self.poll_interval)
