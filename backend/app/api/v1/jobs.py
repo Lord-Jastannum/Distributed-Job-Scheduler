@@ -2,12 +2,13 @@ import uuid
 from datetime import datetime, timezone
 
 from croniter import croniter
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.api.v1.queues import _get_owned_queue
 from app.core.database import get_db
+from app.core.rate_limit import limiter
 from app.models.job import Job
 from app.models.scheduled_job import ScheduledJob
 from app.models.queue import Queue
@@ -41,6 +42,7 @@ def _build_job(queue: Queue, payload: JobCreate, batch_id: uuid.UUID | None = No
         retry_policy_id=queue.default_retry_policy_id,
         idempotency_key=payload.idempotency_key,
         batch_id=batch_id,
+        depends_on_job_id=getattr(payload, "depends_on_job_id", None),
     )
 
 
@@ -53,7 +55,9 @@ def _assert_queue_accepts_jobs(queue: Queue):
 
 
 @router.post("/queues/{queue_id}/jobs", response_model=JobOut, status_code=status.HTTP_201_CREATED)
+@limiter.limit("100/minute")
 def create_job(
+    request: Request,
     queue_id: uuid.UUID,
     payload: JobCreate,
     db: Session = Depends(get_db),
@@ -74,6 +78,14 @@ def create_job(
                 detail="A job with this idempotency_key already exists in this queue",
             )
 
+    if payload.depends_on_job_id:
+        dependency = db.get(Job, payload.depends_on_job_id)
+        if dependency is None or dependency.queue_id != queue_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="depends_on_job_id must reference an existing job in the same queue",
+            )
+
     job = _build_job(queue, payload)
     db.add(job)
     db.commit()
@@ -82,7 +94,9 @@ def create_job(
 
 
 @router.post("/queues/{queue_id}/jobs/batch", response_model=list[JobOut], status_code=status.HTTP_201_CREATED)
+@limiter.limit("20/minute")
 def create_batch_jobs(
+    request: Request,
     queue_id: uuid.UUID,
     payload: BatchJobCreate,
     db: Session = Depends(get_db),

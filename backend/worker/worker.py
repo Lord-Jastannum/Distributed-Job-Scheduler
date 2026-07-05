@@ -73,12 +73,19 @@ CLAIM_SQL = text("""
     UPDATE jobs
     SET status = 'claimed', worker_id = :worker_id, claimed_at = now(), updated_at = now()
     WHERE id IN (
-        SELECT id FROM jobs
-        WHERE queue_id = :queue_id
-          AND status IN ('queued', 'scheduled')
-          AND run_at <= now()
-        ORDER BY priority DESC, run_at ASC
-        FOR UPDATE SKIP LOCKED
+        SELECT j.id FROM jobs j
+        WHERE j.queue_id = :queue_id
+          AND j.status IN ('queued', 'scheduled')
+          AND j.run_at <= now()
+          AND (
+              j.depends_on_job_id IS NULL
+              OR EXISTS (
+                  SELECT 1 FROM jobs dep
+                  WHERE dep.id = j.depends_on_job_id AND dep.status = 'completed'
+              )
+          )
+        ORDER BY j.priority DESC, j.run_at ASC
+        FOR UPDATE OF j SKIP LOCKED
         LIMIT :batch_size
     )
     RETURNING id, type, payload, attempt_count, retry_policy_id;

@@ -8,6 +8,7 @@ export default function JobCreateForm({ queueId, onCreated }) {
   const [timing, setTiming] = useState('immediate') // immediate | delayed | cron
   const [delayMinutes, setDelayMinutes] = useState(5)
   const [cronExpr, setCronExpr] = useState('0 9 * * *')
+  const [dependsOn, setDependsOn] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
@@ -35,10 +36,14 @@ export default function JobCreateForm({ queueId, onCreated }) {
         if (timing === 'delayed') {
           body.run_at = new Date(Date.now() + delayMinutes * 60000).toISOString()
         }
+        if (dependsOn.trim()) {
+          body.depends_on_job_id = dependsOn.trim()
+        }
         await api.createJob(queueId, body)
       }
       setJobType('')
       setPayload('{}')
+      setDependsOn('')
       setOpen(false)
       onCreated?.()
     } catch (err) {
@@ -128,6 +133,18 @@ export default function JobCreateForm({ queueId, onCreated }) {
             className="w-full bg-canvas border border-border rounded px-3 py-1.5 text-sm font-mono text-ink outline-none focus:border-accent"
           />
           <p className="text-xs text-muted mt-1">Standard 5-field cron syntax (minute hour day month weekday)</p>
+        </div>
+      )}
+
+      {timing !== 'cron' && (
+        <div>
+          <label className="block text-xs text-muted mb-1">Depends on job ID (optional)</label>
+          <input
+            value={dependsOn}
+            onChange={(e) => setDependsOn(e.target.value)}
+            placeholder="Paste a job ID to wait for it to complete first"
+            className="w-full bg-canvas border border-border rounded px-3 py-1.5 text-xs font-mono text-ink outline-none focus:border-accent"
+          />
         </div>
       )}
 

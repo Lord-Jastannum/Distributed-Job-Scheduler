@@ -24,6 +24,9 @@ class JobCreate(BaseModel):
     )
     priority: int | None = Field(default=None, ge=-32768, le=32767, description="Overrides queue default if set")
     idempotency_key: str | None = Field(default=None, max_length=255)
+    depends_on_job_id: uuid.UUID | None = Field(
+        default=None, description="This job won't be claimed until the referenced job completes."
+    )
 
 
 class JobOut(BaseModel):
@@ -40,6 +43,7 @@ class JobOut(BaseModel):
     claimed_at: datetime | None
     batch_id: uuid.UUID | None
     scheduled_job_id: uuid.UUID | None
+    depends_on_job_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
 

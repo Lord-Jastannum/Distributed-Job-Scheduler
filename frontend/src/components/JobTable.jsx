@@ -1,8 +1,35 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { api } from '../api'
 import StatusBadge from './StatusBadge'
 
 const STATUS_OPTIONS = ['queued', 'scheduled', 'claimed', 'running', 'completed', 'failed', 'dead_letter']
+
+function useLiveJobs(queueId, enabled) {
+  const [liveJobs, setLiveJobs] = useState(null)
+  const [connected, setConnected] = useState(false)
+  const wsRef = useRef(null)
+
+  useEffect(() => {
+    if (!enabled) return
+    const token = localStorage.getItem('token')
+    if (!token) return
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const ws = new WebSocket(`${protocol}//${window.location.host}/api/v1/ws/queues/${queueId}/jobs?token=${token}`)
+    wsRef.current = ws
+
+    ws.onopen = () => setConnected(true)
+    ws.onclose = () => setConnected(false)
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data)
+      if (data.type === 'jobs_snapshot') setLiveJobs(data.jobs)
+    }
+
+    return () => ws.close()
+  }, [queueId, enabled])
+
+  return { liveJobs, connected }
+}
 
 export default function JobTable({ queueId, refreshKey }) {
   const [jobs, setJobs] = useState([])
@@ -12,6 +39,9 @@ export default function JobTable({ queueId, refreshKey }) {
   const [loading, setLoading] = useState(false)
   const [selectedJob, setSelectedJob] = useState(null)
   const [executions, setExecutions] = useState([])
+
+  const noFiltersActive = !statusFilter && !typeFilter && page === 1
+  const { liveJobs, connected } = useLiveJobs(queueId, noFiltersActive)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -23,10 +53,16 @@ export default function JobTable({ queueId, refreshKey }) {
     }
   }, [queueId, statusFilter, typeFilter, page])
 
-  useEffect(() => { load() }, [load, refreshKey])
+  useEffect(() => {
+    if (noFiltersActive) return // WebSocket drives the table in this mode
+    load()
+  }, [load, refreshKey, noFiltersActive])
+
+  const displayedJobs = noFiltersActive && liveJobs !== null ? liveJobs : jobs
 
   async function openJob(job) {
-    setSelectedJob(job)
+    const full = await api.getJob(job.id)
+    setSelectedJob(full)
     const execs = await api.getJobExecutions(job.id)
     setExecutions(execs)
   }
@@ -51,6 +87,12 @@ export default function JobTable({ queueId, refreshKey }) {
         <button onClick={load} className="text-xs text-muted hover:text-ink px-2 py-1.5">
           {loading ? 'Refreshing...' : '↻ Refresh'}
         </button>
+        {noFiltersActive && (
+          <span className="text-xs font-mono flex items-center gap-1.5 ml-auto">
+            <span className={`h-1.5 w-1.5 rounded-full ${connected ? 'bg-completed pulse' : 'bg-muted'}`} />
+            <span className={connected ? 'text-completed' : 'text-muted'}>{connected ? 'live' : 'connecting...'}</span>
+          </span>
+        )}
       </div>
 
       <div className="border border-border rounded-lg overflow-hidden">
@@ -66,7 +108,7 @@ export default function JobTable({ queueId, refreshKey }) {
             </tr>
           </thead>
           <tbody>
-            {jobs.map((job) => (
+            {displayedJobs.map((job) => (
               <tr
                 key={job.id}
                 onClick={() => openJob(job)}
@@ -80,7 +122,7 @@ export default function JobTable({ queueId, refreshKey }) {
                 <td className="px-3 py-2 text-muted font-mono text-xs">{job.id.slice(0, 8)}</td>
               </tr>
             ))}
-            {jobs.length === 0 && !loading && (
+            {displayedJobs.length === 0 && !loading && (
               <tr><td colSpan={6} className="px-3 py-8 text-center text-muted text-sm">No jobs match these filters</td></tr>
             )}
           </tbody>
@@ -97,7 +139,7 @@ export default function JobTable({ queueId, refreshKey }) {
         </button>
         <span className="text-xs text-muted">Page {page}</span>
         <button
-          disabled={jobs.length < 20}
+          disabled={displayedJobs.length < 20}
           onClick={() => setPage((p) => p + 1)}
           className="text-xs text-muted hover:text-ink disabled:opacity-30 px-2 py-1"
         >
